@@ -1,0 +1,187 @@
+
+cap.c,1677
+struct http_struct 21,352
+    struct  in_addr src_addr;22,373
+    struct  in_addr dst_addr;23,403
+    int src_port;24,433
+    int dst_port;25,451
+    u_int32_t seq;26,469
+    u_int32_t ack;27,488
+    u_int32_t tcp_datalen;28,507
+    char *method;method29,534
+    char *request_uri;request_uri30,552
+    char *status_code;status_code31,575
+    int direction;32,598
+    struct timeval timestamp;33,617
+#define REQUEST 35,650
+#define RESPONSE 36,668
+#define BUFF_SIZE 37,687
+static unsigned int parse_count 55,1375
+static int daemon_mode 56,1412
+static char *interface interface57,1440
+static char *capfilter capfilter58,1471
+static char *use_outfile use_outfile59,1502
+static int set_promisc 60,1535
+static char *pid_filename pid_filename61,1563
+static int use_stats 62,1597
+static int stats_interval 63,1623
+static int force_flush 64,1654
+int quiet_mode 65,1682
+int use_syslog 66,1751
+static pcap_t *pcap_hnd pcap_hnd68,1821
+static char *buf buf69,1887
+static unsigned int num_parsed 70,1912
+static time_t start_time 71,1994
+static int link_header_offset 72,2074
+static char default_capfilter[default_capfilter73,2109
+char *methods[methods75,2172
+int have_request_method(77,2208
+pcap_t *prepare_capture(prepare_capture97,2581
+void set_link_header_offset(133,3733
+void runas_daemon(155,4187
+void print_http(201,5435
+void parse_http_packet2(216,6191
+void parse_http_packet(219,6287
+char *parse_header_line(parse_header_line334,10026
+int parse_request(360,10661
+int parse_response(400,11701
+void handle_signal(429,12510
+void cleanup(456,12987
+void print_stats(469,13227
+void display_usage(495,14037
+int main(515,14864
+
+slab.c,662
+static int __hurd_slab_nr_pages;38,1154
+union hurd_bufctl44,1398
+  union hurd_bufctl *next;next46,1418
+  struct hurd_slab *slab;slab47,1445
+struct hurd_slab54,1637
+  struct hurd_slab *next;next56,1656
+  struct hurd_slab *prev;prev57,1682
+  int refcount;62,1881
+  union hurd_bufctl *free_list;free_list65,1955
+allocate_buffer 72,2211
+deallocate_buffer 90,2730
+insert_slab 106,3141
+remove_slab 122,3510
+reap 149,4152
+init_space 206,5630
+grow 235,6532
+hurd_slab_init 307,8686
+hurd_slab_create 353,10120
+hurd_slab_destroy 385,10879
+hurd_slab_free 419,11798
+hurd_slab_alloc 431,12008
+put_on_slab_list 483,13622
+hurd_slab_dealloc 494,13879
+
+stats.c,2902
+#define MAX_URI_LEN 22,386
+#define HASHSIZE 23,410
+#define NODE_BLOCKSIZE 24,432
+#define MAGIC 25,459
+#define MAGIC_LEN 26,483
+#define UDP_BUFF_COUNT 27,503
+#define UDP_BUFF_SIZE 28,530
+#define SERV_PORT 29,557
+struct udp_buffer 33,602
+    struct iovec iov[iov34,622
+    int idx;35,649
+    int used;36,662
+    int sockfd;37,676
+    int printable;38,692
+    struct sockaddr_in dest;39,711
+struct udp_buffer udp_buffer;41,743
+static int init 42,773
+static int see_recycle 43,794
+struct uri_request 44,822
+    struct uri_record record;45,843
+    struct uri_stats *stat;stat46,873
+    int flag;47,901
+    struct timeval timestamp;48,915
+    struct uri_request *next;next50,970
+    struct uri_request **pprev;pprev51,1000
+    struct uri_request *next_req;next_req53,1060
+    struct uri_request **pprev_req;pprev_req54,1094
+struct uri_stats 57,1134
+    int users;58,1153
+    char uri[uri59,1168
+    int port;60,1199
+    struct  in_addr host;61,1213
+    unsigned int count;62,1239
+    long long total;63,1263
+    unsigned int rps;64,1284
+    time_t first_packet;65,1306
+    time_t last_packet;66,1331
+    float time_used;67,1355
+    int rep_count;68,1376
+    float rep;69,1395
+    struct uri_stats *next;next70,1410
+struct thread_args 73,1442
+    unsigned int interval;74,1463
+    unsigned int printable;75,1490
+int node_count 77,1521
+int request_count 78,1541
+static pthread_t thread;89,1946
+static int thread_created 90,1971
+static pthread_mutex_t stats_lock;91,2002
+static struct uri_stats **stats;stats92,2037
+static struct uri_request **requests;requests93,2070
+static struct uri_request requests_queue;94,2108
+static struct uri_request **requests_queue_tail;requests_queue_tail95,2150
+static struct thread_args thread_args;96,2199
+static hurd_slab_space_t request_slab;98,2239
+static hurd_slab_space_t stats_slab;99,2278
+unsigned int hash_uri(102,2317
+#define HASH_LOG	107,2434
+#define HASH_SIZE	108,2456
+unsigned int hash_addr(122,2791
+#define HASH_LOG	124,2838
+#define HASH_SIZE	125,2860
+unsigned int hash_request(135,3051
+struct uri_request *alloc_uri_request(alloc_uri_request150,3387
+void free_uri_request(162,3607
+void init_stats(173,3852
+void create_stats_thread(201,4772
+void cleanup_stats(236,5688
+void exit_stats_thread(246,5815
+void *run_stats run_stats272,6434
+void init_udp_buffers(284,6668
+int send_udp_buffer(307,7283
+void send_remain(332,7796
+void send_report(347,8030
+void display_stats(386,9121
+void remove_request(466,11183
+void add_request(477,11390
+void recycle_request(506,12301
+struct uri_request *find_request(find_request535,13181
+void remove_from_recycle(566,14403
+void update_request_continued(584,14805
+void finish_request(607,15405
+void update_stats(649,16624
+struct uri_stats *get_uri(get_uri691,17779
+struct uri_stats *get_node(get_node705,18257
+void put_node(717,18451
+
+test.c,253
+static hurd_slab_space_t slab;3,37
+struct foo 5,69
+    int val;6,82
+    struct foo *next;next7,95
+struct foo *foo;foo9,120
+struct foo **find(find11,138
+struct foo *new_foo(new_foo22,321
+void del_foo(29,413
+void show(35,479
+int main(45,595
+
+utils.c,264
+char *str_strip_whitespace(str_strip_whitespace8,99
+char *str_tolower(str_tolower23,404
+int str_compare(39,638
+int str_copy(56,979
+int str_is_ascii(70,1297
+void debug_ascii(81,1471
+char *str_duplicate(str_duplicate92,1699
+unsigned int hash_str(110,2150
