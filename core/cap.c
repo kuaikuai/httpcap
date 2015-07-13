@@ -13,25 +13,12 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <pthread.h>
 #include "error.h"
 #include "tcp.h"
 #include "stats.h"
 #include "utils.h"
 
-struct http_struct {
-    struct  in_addr src_addr;
-    struct  in_addr dst_addr;
-    int src_port;
-    int dst_port;
-    u_int32_t seq;
-    u_int32_t ack;
-    u_int32_t tcp_datalen;
-    char *method;
-    char *request_uri;
-    char *status_code;
-    int direction;
-    struct timeval timestamp;
-};
 #define REQUEST 1
 #define RESPONSE 2
 #define BUFF_SIZE 1024
@@ -44,8 +31,8 @@ void runas_daemon();
 int have_request_method(const char *str);
 void parse_http_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *pkt);
 char *parse_header_line(char *header_line);
-int parse_request(char *header_line, struct http_struct *http);
-int parse_response(char *header_line, struct http_struct *http);
+int parse_request(char *header_line, struct uri_record *http);
+int parse_response(char *header_line, struct uri_record *http);
 void handle_signal(int sig);
 void cleanup();
 void print_stats();
@@ -198,7 +185,7 @@ void runas_daemon() {
 
     return;
 }
-void print_http(struct http_struct *http_struct, struct timeval tv)
+void print_http(struct uri_record *http_struct, struct timeval tv)
 {
     char saddr[INET6_ADDRSTRLEN], daddr[INET6_ADDRSTRLEN];
     struct tm *pkt_time;
@@ -208,9 +195,54 @@ void print_http(struct http_struct *http_struct, struct timeval tv)
     strftime(ts, 127, "%Y-%m-%d %H:%M:%S", pkt_time);
     inet_ntop(AF_INET, &http_struct->src_addr, saddr, sizeof(saddr));
     inet_ntop(AF_INET, &http_struct->dst_addr, daddr, sizeof(daddr));
-    printf("%s.%06ld seq %u ack %u src_ip:%s src_port:%d dst_ip:%s dst_port:%d method:%s %s\n", ts, tv.tv_usec,
+    printf("%s.%06ld seq %u ack %u src_ip:%s src_port:%d dst_ip:%s dst_port:%d method:%s uri:%s status_code:%d\n", ts, tv.tv_usec,
            http_struct->seq, http_struct->ack, saddr, http_struct->src_port, daddr, http_struct->dst_port,
-           http_struct->method, (http_struct->direction==REQUEST)?http_struct->request_uri:http_struct->status_code);
+           http_struct->method, http_struct->uri, http_struct->status_code);
+}
+
+struct uri_record record_list_head;
+struct uri_record * volatile record_list_tailp;
+struct uri_record * volatile record_list_headp;
+
+void init_record_list()
+{
+    struct uri_record* head = malloc(sizeof(struct uri_record));
+    memset(head, 0, sizeof(struct uri_record));
+    record_list_tailp = head;
+    record_list_headp = head;
+    record_list_headp->next = NULL;
+}
+
+void add_record(struct uri_record* record)
+{
+    record->next = NULL;
+    record_list_tailp->next = record;
+    record_list_tailp = record;
+}
+
+void* record_thread_func(void *p)
+{
+    while(1) {
+        struct uri_record *record;
+        while(record_list_headp == record_list_tailp) {
+            usleep(10000);
+        }
+        record = record_list_headp;
+        record_list_headp = record->next;
+
+        if(record->uri[0] != '\0') {
+            update_stats(record, record->timestamp);
+        }
+        else {
+            if(record->status_code == 100) {
+                update_request_continued(record, record->timestamp);
+            }
+            else {
+                finish_request(record, record->timestamp);
+            }
+        }
+        free(record);
+    }
 }
 
 void parse_http_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *pkt) {
@@ -221,10 +253,7 @@ void parse_http_packet(u_char *args, const struct pcap_pkthdr *header, const u_c
     const struct tcp_header *tcp;
     const char *data;
     int ip_headlen, tcp_headlen, data_len, family;
-    struct http_struct http_struct;
-    int is_fin = 0;
-
-    memset(&http_struct, 0, sizeof(struct http_struct));
+    struct uri_record *record;
 
     ip = (struct ip_header *) (pkt + link_header_offset);
 
@@ -238,48 +267,25 @@ void parse_http_packet(u_char *args, const struct pcap_pkthdr *header, const u_c
 
     tcp = (struct tcp_header *) ((char *)ip + ip_headlen);
     tcp_headlen = TH_OFF(tcp) * 4;
-    is_fin = (tcp->th_flags & TH_FIN);
     if (tcp_headlen< 20) return;
+
     data = (char *)tcp + tcp_headlen;
     data_len = (header->caplen - (link_header_offset + ip_headlen + tcp_headlen));
-    if (data_len < 0) {
-        return;
-    }
-    http_struct.tcp_datalen = ntohs(ip->ip_len) - ip_headlen - tcp_headlen;
-
-    http_struct.src_addr = ip->ip_src;
-    http_struct.dst_addr = ip->ip_dst;
-
-    http_struct.src_port = ntohs(tcp->th_sport);
-    http_struct.dst_port = ntohs(tcp->th_dport);
-
-    http_struct.seq = ntohl(tcp->th_seq);
-    http_struct.ack = ntohl(tcp->th_ack);
-    /* capture timestamp */
-    http_struct.timestamp = header->ts;
-
-    if (0 == http_struct.tcp_datalen) {
-        struct uri_record record;
-        record.uri = http_struct.request_uri;
-        record.src_port = http_struct.src_port;
-        record.src_addr = http_struct.src_addr;
-        record.dst_port = http_struct.dst_port;
-        record.dst_addr = http_struct.dst_addr;
-        record.ack = http_struct.ack;
-        record.seq = http_struct.seq;
-        if(is_fin) {
-            fin_response(&record);
-        }
-        return;
-    }
+    if (data_len <= 0) return;
 
     if (have_request_method(data)) {
         is_request = 1;
     } else if (strncmp(data, "HTTP/", strlen("HTTP/")) == 0) {
         is_response = 1;
     } else {
-        //return;
+        return;
     }
+    record = malloc(sizeof(struct uri_record));
+    if(NULL == record) {
+        return;
+    }
+    memset(record, 0, sizeof(struct uri_record));
+    record->tcp_datalen = ntohs(ip->ip_len) - ip_headlen - tcp_headlen;
 
     if (data_len >= BUFF_SIZE) data_len = BUFF_SIZE-1;
     memcpy(buf, data, data_len);
@@ -290,55 +296,33 @@ void parse_http_packet(u_char *args, const struct pcap_pkthdr *header, const u_c
     buf[data_len] = '\0';
     if ((header_line = parse_header_line(buf)) == NULL) return;
     if (is_request) {
-        if (parse_request(header_line, &http_struct)) return;
+        if (parse_request(header_line, record)) return;
     }
     else if (is_response) {
-        if (parse_response(header_line, &http_struct)) return;
+        if (parse_response(header_line, record)) return;
     }
+    record->src_addr = ip->ip_src;
+    record->dst_addr = ip->ip_dst;
 
-    if(http_struct.request_uri) {
-        char *p = strstr(http_struct.request_uri, "?");
-        if(p) *p = '\0';
-    }
+    record->src_port = ntohs(tcp->th_sport);
+    record->dst_port = ntohs(tcp->th_dport);
+    record->seq = ntohl(tcp->th_seq);
+    record->ack = ntohl(tcp->th_ack);
+    /* capture timestamp */
+    record->timestamp = header->ts;
+    char *p = strstr(record->uri, "?");
+    if(p) *p = '\0';
+
     if (use_stats) {
-        int err = -1;
-        struct uri_record record;
-        record.uri = http_struct.request_uri;
-        record.src_port = http_struct.src_port;
-        record.src_addr = http_struct.src_addr;
-        record.dst_port = http_struct.dst_port;
-        record.dst_addr = http_struct.dst_addr;
-        record.ack = http_struct.ack;
-        record.seq = http_struct.seq;
-        record.tcp_datalen = http_struct.tcp_datalen;
-
-        if (http_struct.request_uri) {
-            // record the request
-            err = update_stats(&record, header->ts);
+        record->status_code = 0;
+        if(record->status_code != 100) {
+            record->tcp_datalen = 0;
         }
-        else {
-            if(http_struct.status_code && 
-               strcmp(http_struct.status_code, "100") == 0) {
-                update_request_continued(&record, header->ts);
-                /* printf("continue req ack:%u seq:%u datalen:%u \n",record.ack,record.seq,record.tcp_datalen); */
-            }
-            else {
-                // record the response
-                err = finish_request(&record, header->ts, is_fin);
-                is_fin = 0;
-            }
-        }
-        if(err < 0) {
-            // update in/out data_len
-            update_request_datalen(&record);
-        }
-        if(is_fin) {
-            fin_response(&record);
-        }
+        add_record(record);
     }
-
-    if (!use_stats) {
-        print_http(&http_struct, header->ts);
+    else {
+        print_http(record, header->ts);
+        free(record);
     }
 
     num_parsed++;
@@ -376,37 +360,10 @@ char *parse_header_line(char *header_line) {
     return header_line;
 }
 
-int analyse_EPG_action(char *args, char *uri)
+int parse_request(char *header_line, struct uri_record *record)
 {
-    char *start, *end;
-
-    if(strcmp(uri, "/cgi-bin/epg_index.fcgi") != 0) {
-        return -1;
-    }
-
-    start = strstr(args, "action=");
-    if(NULL == start) {
-        return -1;
-    }
-    // 7 is strlen("action=")
-    start += 7;
-    end = strchr(start, '%');
-    if(end) {
-        *end = '\0';
-    }
-    end = strchr(start, '&');
-    if(end) {
-        *end = '\0';
-    }
-    strcat(uri, "_");
-    strcat(uri, start);
-
-    return 0;
-}
-
-int parse_request(char *header_line, struct http_struct *http_struct) {
     char *method, *request_uri, *http_version;
-    char *p;
+
 #ifdef DEBUG
     ASSERT(header_line);
     ASSERT(strlen(header_line) > 0);
@@ -423,20 +380,13 @@ int parse_request(char *header_line, struct http_struct *http_struct) {
 #if 1
         if ((http_version = strchr(request_uri, '?')) != NULL) {
             *http_version = '\0';
-            /* do analysis EPG action */
-            http_version++;
-            analyse_EPG_action(http_version, request_uri);
+            //printf("got ?\n");
             goto LAST;
         }
 #endif
         return 1;
     }
-    // do xxxx?args=xxx
-    if ((p = strchr(request_uri, '?')) != NULL) {
-        *p = '\0';
-        /* do analysis EPG action */
-        analyse_EPG_action(p+1, request_uri);
-    }
+
     *http_version++ = '\0';
     while (isspace(*http_version))
         http_version++;
@@ -444,14 +394,15 @@ int parse_request(char *header_line, struct http_struct *http_struct) {
     if (strncmp(http_version, HTTP_STRING, strlen(HTTP_STRING)) != 0)
         return 1;
 LAST:
-    http_struct->method = method;
-    http_struct->request_uri = request_uri;
-    http_struct->direction = REQUEST;
+    snprintf(record->method, METHOD_LEN, "%s", method);
+    snprintf(record->uri,URI_LEN,"%s", request_uri);
+    record->direction = REQUEST;
 
     return 0;
 }
 
-int parse_response(char *header_line, struct http_struct *http_struct) {
+int parse_response(char *header_line, struct uri_record *record)
+{
     char *http_version, *status_code, *reason_phrase;
 
 #ifdef DEBUG
@@ -472,9 +423,9 @@ int parse_response(char *header_line, struct http_struct *http_struct) {
     *reason_phrase++ = '\0';
     while (isspace(*reason_phrase))
         reason_phrase++;
-    http_struct->method = "RESPONSE";
-    http_struct->status_code = status_code;
-    http_struct->direction = RESPONSE;
+    snprintf(record->method, METHOD_LEN, "RESPONSE");
+    record->status_code = atoi(status_code);
+    record->direction = RESPONSE;
 
     return 0;
 }
@@ -569,16 +520,14 @@ void display_usage() {
 int main(int argc, char **argv)
 {
     int opt;
+    pthread_t tid;
     extern char *optarg;
     extern int optind;
     int loop_status;
 
     signal(SIGHUP, &handle_signal);
     signal(SIGINT, &handle_signal);
-    if(argc < 2) {
-        display_usage();
-        return -1;
-    }
+
     /* Process command line arguments */
     while ((opt = getopt(argc, argv, "dFhpi:n:o:st:Sr")) != -1) {
         switch (opt) {
@@ -607,8 +556,6 @@ int main(int argc, char **argv)
         default: display_usage();
         }
     }
-
-
     if (parse_count < 0)
         LOG_DIE("Invalid -n value, must be 0 or greater");
 
@@ -625,12 +572,16 @@ int main(int argc, char **argv)
         if (setvbuf(stdout, NULL, _IONBF, 0) != 0)
             LOG_WARN("Cannot disable buffering on stdout");
     }
-
     pid_filename = "/tmp/httpcap.pid";
 
     pcap_hnd = prepare_capture(interface, set_promisc, capfilter);
 
     if (daemon_mode) runas_daemon();
+
+    init_record_list();
+    //pthread_mutex_init(&record_mutex, NULL);
+    //pthread_cond_init(&record_cond, NULL);
+    pthread_create(&tid, NULL, record_thread_func, NULL);
 
     if ((buf = malloc(BUFF_SIZE + 1)) == NULL)
         LOG_DIE("Cannot allocate memory for packet data buffer");

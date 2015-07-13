@@ -21,9 +21,7 @@
 #include "slab.h"
 
 #define MAX_URI_LEN 128
-#define HASH_LOG	  20
-#define HASH_SIZE	  (1 << HASH_LOG)
-#define HASHSIZE HASH_SIZE
+//#define HASHSIZE 2048
 #define NODE_BLOCKSIZE 100
 #define MAGIC "#NUL@$#"
 #define MAGIC_LEN 7
@@ -58,21 +56,19 @@ struct uri_request {
 };
 
 struct uri_stats {
-    int users;
+    volatile int users;
     char uri[MAX_URI_LEN + 1];
     int port;
     struct  in_addr host;
-    unsigned int count;
-    long long total;
+    volatile unsigned int count;
+    //long long total;
     unsigned int rps;
-    time_t first_packet;
-    time_t last_packet;
-    float time_used;
+    volatile time_t first_packet;
+    volatile time_t last_packet;
+    volatile long long time_used;
     unsigned long timeout;
-    int rep_count;
+    volatile int rep_count;
     float rep;
-    long in_datalen;
-    long out_datalen;
     struct uri_stats *next;
 };
 
@@ -95,6 +91,7 @@ void remove_from_recycle(struct uri_request *request);
 static pthread_t thread;
 static int thread_created = 0;
 static pthread_mutex_t stats_lock;
+static pthread_mutex_t request_queue_lock;
 static struct uri_stats **stats;
 static struct uri_request **requests;
 static struct uri_request requests_queue;
@@ -104,23 +101,87 @@ static struct thread_args thread_args;
 static hurd_slab_space_t request_slab;
 static hurd_slab_space_t stats_slab;
 
+#define HASH_LOG	  18
+#define HASH_SIZE	  (1 << HASH_LOG)
+#define LOCK_TABLE_SIZE 256
+#define LOCK_TABLE_MASK (LOCK_TABLE_SIZE - 1)
+static pthread_mutex_t stats_lock_table[LOCK_TABLE_SIZE];
+static pthread_mutex_t request_lock_table[LOCK_TABLE_SIZE];
 
-unsigned int hash_uri(struct uri_record *node)
+void init_stats_lock_table()
+{
+   int i, rc;
+   for (i = 0; i < LOCK_TABLE_SIZE; i++) {
+      rc = pthread_mutex_init(&stats_lock_table[i], NULL);
+      if (rc != 0) {
+          LOG_WARN("Statistics thread cancellation failed with error %d", rc);
+          exit(-1);
+      }
+   }
+}
+
+void init_request_lock_table()
+{
+   int i, rc;
+   for (i = 0; i < LOCK_TABLE_SIZE; i++) {
+      rc = pthread_mutex_init(&request_lock_table[i], NULL);
+      if (rc != 0) {
+          LOG_WARN("Statistics thread cancellation failed with error %d", rc);
+          exit(-1);
+      }
+   }
+}
+
+void lock_stats(int hash)
+{
+   pthread_mutex_lock(&stats_lock_table[hash & LOCK_TABLE_MASK]);
+}
+
+void unlock_stats(int hash)
+{
+   pthread_mutex_unlock(&stats_lock_table[hash & LOCK_TABLE_MASK]);
+}
+
+void lock_request(int hash)
+{
+   pthread_mutex_lock(&request_lock_table[hash & LOCK_TABLE_MASK]);
+}
+
+int trylock_request(int hash)
+{
+    return pthread_mutex_trylock(&request_lock_table[hash & LOCK_TABLE_MASK]);
+}
+
+void unlock_request(int hash)
+{
+   pthread_mutex_unlock(&request_lock_table[hash & LOCK_TABLE_MASK]);
+}
+
+unsigned int _hash_stats(char *uri, struct in_addr addr, int port)
 {
     unsigned int hashval;
     int hash = 0;
     unsigned int value;
-    hashval = hash_str(node->uri, HASHSIZE);
-    value = node->dst_addr.s_addr;
+
+    hashval = hash_str(uri, HASH_SIZE);
+    value = addr.s_addr;
     do {
         hash ^= value;
     } while ((value >>= HASH_LOG));
 
     hashval ^= hash & (HASH_SIZE - 1);
-    hashval ^= node->dst_port;
+    hashval ^= port;
 
-    debug_ascii(node->uri,"Hash_uri");
-    return hashval & (HASHSIZE - 1);
+    return hashval & (HASH_SIZE - 1);
+}
+
+unsigned int hash_stats(struct uri_stats *stat)
+{
+    return _hash_stats(stat->uri, stat->host, stat->port);
+}
+unsigned int hash_stats_record(struct uri_record *node)
+{
+    return _hash_stats(node->uri, node->dst_addr, node->dst_port);
 }
 
 unsigned int hash_addr(struct  in_addr addr)
@@ -138,7 +199,7 @@ unsigned int hash_request(struct uri_record *record)
 {
     unsigned int hashval;
 
-    if (record->uri) {
+    if (record->uri[0] != '\0') {
         hashval = hash_addr(record->src_addr);
         hashval ^= record->src_port;
     }
@@ -146,7 +207,7 @@ unsigned int hash_request(struct uri_record *record)
         hashval = hash_addr(record->dst_addr);
         hashval ^= record->dst_port;
     }
-    return hashval & (HASHSIZE - 1);
+    return hashval & (HASH_SIZE - 1);
 }
 
 struct uri_request *alloc_uri_request()
@@ -163,7 +224,10 @@ struct uri_request *alloc_uri_request()
 
 void free_uri_request(struct uri_request *request)
 {
-    if(request->stat && request->stat->users > 0) request->stat->users--;
+    if(request->stat && request->stat->users > 0) {
+        //request->stat->users--;
+        __sync_fetch_and_sub(&(request->stat->users), 1);
+    }
 #ifdef USE_SLAB
     hurd_slab_dealloc(request_slab, request);
 #else
@@ -175,10 +239,10 @@ void free_uri_request(struct uri_request *request)
 void init_stats(int interval, int printable)
 {
     int err;
-    if ((stats = (struct uri_stats **) calloc(HASHSIZE, sizeof(struct uri_stats *))) == NULL)
+    if ((stats = (struct uri_stats **) calloc(HASH_SIZE, sizeof(struct uri_stats *))) == NULL)
         LOG_DIE("Cannot allocate memory for host stats");
 
-    if ((requests = (struct uri_request **) calloc(HASHSIZE, sizeof(struct uri_request *))) == NULL)
+    if ((requests = (struct uri_request **) calloc(HASH_SIZE, sizeof(struct uri_request *))) == NULL)
         LOG_DIE("Cannot allocate memory for requests");
 
     err = hurd_slab_create(sizeof(struct uri_stats), 0, NULL, NULL, NULL, NULL, NULL, &stats_slab);
@@ -200,6 +264,15 @@ void init_stats(int interval, int printable)
     return;
 }
 
+void* recycle_thread_func(void *p)
+{
+    time_t now;
+    while(1) {
+        now = time(NULL);
+        recycle_request(now);
+        sleep(10);
+    }
+}
 void create_stats_thread(int interval, int printable)
 {
     sigset_t set;
@@ -214,15 +287,24 @@ void create_stats_thread(int interval, int printable)
     sigaddset(&set, SIGINT);
     sigaddset(&set, SIGHUP);
 
+    init_stats_lock_table();
     s = pthread_mutex_init(&stats_lock, NULL);
     if (s != 0)
         LOG_DIE("Statistics thread mutex initialization failed with error %d", s);
+    init_request_lock_table();
+    s = pthread_mutex_init(&request_queue_lock, NULL);
+    if (s != 0)
+        LOG_DIE("request queue mutex initialization failed with error %d", s);
 
     s = pthread_sigmask(SIG_BLOCK, &set, NULL);
     if (s != 0)
         LOG_DIE("Statistics thread signal blocking failed with error %d", s);
 
     s = pthread_create(&thread, NULL, run_stats, (void *) &thread_args);
+    if (s != 0)
+        LOG_DIE("Statistics thread creation failed with error %d", s);
+
+    s = pthread_create(&thread, NULL, recycle_thread_func, NULL);
     if (s != 0)
         LOG_DIE("Statistics thread creation failed with error %d", s);
 
@@ -364,13 +446,13 @@ void send_report(struct uri_stats *node, time_t time)
     iov = &buffer->iov[buffer->idx];
     addr[0] = 0;
     inet_ntop(AF_INET, &node->host, addr, sizeof(addr));
-    len = snprintf(iov->iov_base, UDP_BUFF_SIZE, 
-                   "URL ip:%s port:%d uri:%s rps:%d rep:%f in:%ld out:%ld timestamp:%ld timeout:%lu\r\n",
-                   addr, node->port, node->uri, node->rps, node->rep, node->in_datalen, node->out_datalen, time, node->timeout);
+    len = snprintf(iov->iov_base, UDP_BUFF_SIZE,
+                   "URL ip:%s port:%d uri:%s rps:%d rep:%f timestamp:%ld timeout:%ld\r\n",
+                   addr, node->port, node->uri, node->rps, node->rep, time, node->timeout);
     iov->iov_len = len;
 
     if (buffer->printable) {
-        printf("%s", (char *)iov->iov_base);
+        printf(iov->iov_base);
         return;
     }
 
@@ -398,18 +480,18 @@ void display_stats(int printable) {
         init_udp_buffers(printable);
         init = 1;
     }
-    if (thread_created)
-        pthread_mutex_lock(&stats_lock);
 
     now = time(NULL);
-    recycle_request(now);
+    //recycle_request(now);
 
-    for (i = 0; i < HASHSIZE; i++) {
+    for (i = 0; i < HASH_SIZE; i++) {
         //int tmp = 0;
-
+        if(NULL == stats[i]) {
+            continue;
+        }
+        lock_stats(i);
         node = stats[i];
         prev = NULL;
-
         while (node != NULL) {
             //tmp++;
             delta = now - node->first_packet;
@@ -425,24 +507,19 @@ void display_stats(int printable) {
                 node->rps = rps;
                 if(time_used) {
                     node->rep = time_used/1000000;
-                    //node->in_datalen = node->in_datalen * 1000000 / time_used;
-                    //node->out_datalen = node->out_datalen * 1000000 / time_used;
                 }
                 send_report(node, now);
                 node->first_packet = 0;
                 node->count = 0;
-                // reset stats
                 if (node->rep_count) {
                     node->time_used = 0;
                     node->rep_count = 0;
                     node->timeout = 0;
-                    node->in_datalen = 0;
-                    node->out_datalen = 0;
                 }
             }
-            else if(node->users == 0
-                    && node->last_packet != 0 
-                    && now > node->last_packet + 10) {
+            else if(node->users <= 0
+                    && node->last_packet != 0
+                    && now > node->last_packet + 30) {
                 if (prev == NULL) {
                     stats[i] = node->next;
                 }
@@ -456,17 +533,10 @@ void display_stats(int printable) {
             }
             prev = node;
             node = node->next;
-#if 0
-            if(tmp > 100) {
-                printf("catch you!!!!!!!!\n");
-                break;
-            }
-#endif
         }
+        unlock_stats(i);
     }
     send_remain();
-    if (thread_created)
-        pthread_mutex_unlock(&stats_lock);
 
     return;
 }
@@ -484,21 +554,26 @@ void remove_request(struct uri_request *request)
 
 void add_request(struct uri_record *record, struct timeval tv, struct uri_stats *node)
 {
-    struct uri_request *request, *p;
-    int hashval;
+    struct uri_request *request;
+    unsigned int hashval;
+    hashval = hash_request(record);
+    lock_request(hashval);
+    /*
     p = find_request(record);
     if(p != NULL) {
+        unlock_request(hashval);
         return;
     }
+    */
     request = alloc_uri_request();
     request->record = *record;
     /* IMPORTANT!! USE  node's URI */
-    request->record.uri = node->uri;
+    snprintf(request->record.uri, sizeof(request->record.uri), node->uri);
     request->timestamp = tv;
     request->stat = node;
-    node->users++;
+    /* node->users++; */
+    __sync_fetch_and_add(&(node->users), 1);
     /* add it into hash table */
-    hashval = hash_request(record);
     if(requests[hashval]) requests[hashval]->pprev = &request->next;
     request->pprev = &requests[hashval];
     request->next = requests[hashval];
@@ -508,34 +583,36 @@ void add_request(struct uri_record *record, struct timeval tv, struct uri_stats 
     request->pprev_req = requests_queue_tail;
     *requests_queue_tail = request;
     requests_queue_tail = &(request->next_req);
+
+    unlock_request(hashval);
 }
 
 void recycle_request(time_t t)
 {
     struct uri_request *request, *tmp;
-    int count = 1000;
-    struct timeval tv = {0};
+    unsigned int key;
+    //int count = 1000;
     //float time_used=0;
-    gettimeofday(&tv, NULL);
+    pthread_mutex_lock(&request_queue_lock);
     request = requests_queue.next_req;
-    while(count > 0 && request != NULL) {
+    while(request != NULL) {
         struct uri_stats *uri = request->stat;
-        if(t > request->timestamp.tv_sec + 300) {
-#if 0
-            time_used = (tv.tv_sec - request->timestamp.tv_sec) * 1000000 + (tv.tv_usec - request->timestamp.tv_usec);
-            uri->time_used += time_used;
-            uri->rep_count++;
-#endif
+        if(t > request->timestamp.tv_sec + 30) {
             uri->timeout++;
             if(see_recycle) {
-                printf("recycle: uri:%s, port:%u, seq:%u, ack:%u flag:%u\n", 
+                printf("recycle: uri:%s, port:%u, seq:%u, ack:%u flag:%u\n",
                        request->record.uri, request->record.dst_port,
                        request->record.seq, request->record.ack, request->flag);
             }
             tmp = request->next_req;
+            key = hash_request(&(request->record));
+            if(EBUSY == trylock_request(key)) {
+                break;
+            }
             remove_from_recycle(request);
             remove_request(request);
             free_uri_request(request);
+            unlock_request(key);
             //count--;
             request = tmp;
         }
@@ -545,34 +622,9 @@ void recycle_request(time_t t)
     }
     /* AT LAST ?*/
     if (request == NULL) {
-        requests_queue_tail = &(requests_queue.next_req);      
+        requests_queue_tail = &(requests_queue.next_req);
     }
-}
-
-void update_request_datalen(struct uri_record *record)
-{
-    struct uri_request *req;
-    //printf("begin find\n");
-    int hashval = hash_request(record);
-    for ( req = requests[hashval]; req != NULL; req = req->next) {
-        /* request */
-        if(req->record.src_port == record->src_port
-           && memcmp(&req->record.src_addr, &record->src_addr, sizeof(struct in_addr)) == 0) {
-            if(req->stat) {
-                req->stat->in_datalen += record->tcp_datalen;
-            }
-            return;
-        }
-        /* response */
-        if(req->record.src_port == record->dst_port
-           && memcmp(&req->record.src_addr, &record->dst_addr, sizeof(struct in_addr)) == 0) {
-            if(req->stat) {
-                req->stat->out_datalen += record->tcp_datalen;
-            }
-            return;
-        }
-    }
-
+    pthread_mutex_unlock(&request_queue_lock);
 }
 
 struct uri_request *find_request(struct uri_record *record)
@@ -582,15 +634,15 @@ struct uri_request *find_request(struct uri_record *record)
     int hashval = hash_request(record);
     for ( req = requests[hashval]; req != NULL; req = req->next) {
         /* request */
-        if(record->uri) {
-            if(req->record.seq == record->seq 
+        if(record->uri[0] != '\0') {
+            if(req->record.seq == record->seq
                && req->record.src_port == record->src_port
                && memcmp(&req->record.src_addr, &record->src_addr, sizeof(struct in_addr)) == 0)
                 return req;
         }
         /* response */
         else {
-            if(req->record.ack == record->seq 
+            if(req->record.ack == record->seq
                && req->record.src_port == record->dst_port
                && memcmp(&req->record.src_addr, &record->dst_addr, sizeof(struct in_addr)) == 0)
                 return req;
@@ -605,35 +657,6 @@ struct uri_request *find_request(struct uri_record *record)
 
     return NULL;
 }
-
-struct uri_request *find_response_noseq(struct uri_record *record)
-{
-    struct uri_request *req;
-    int hashval = hash_request(record);
-    for ( req = requests[hashval]; req != NULL; req = req->next) {
-        if(req->record.src_port == record->dst_port
-           && memcmp(&req->record.src_addr, &record->dst_addr, sizeof(struct in_addr)) == 0) {
-            return req;
-        }
-    }
-
-    return NULL;
-}
-
-struct uri_request *find_response(struct uri_record *record)
-{
-    struct uri_request *req;
-    int hashval = hash_request(record);
-    for ( req = requests[hashval]; req != NULL; req = req->next) {
-        if(req->record.ack == record->seq 
-           && req->record.src_port == record->dst_port
-           && memcmp(&req->record.src_addr, &record->dst_addr, sizeof(struct in_addr)) == 0)
-            return req;
-    }
-
-    return NULL;
-}
-
 
 void remove_from_recycle(struct uri_request *request)
 {
@@ -657,9 +680,8 @@ void update_request_continued(struct uri_record *record, struct timeval tv)
 {
     struct uri_request *request;
 
-    if (thread_created)
-        pthread_mutex_lock(&stats_lock);
-
+    int hash = hash_request(record);
+    lock_request(hash);
     request = find_request(record);
     if(request == NULL) {
         goto LAST;
@@ -672,49 +694,20 @@ void update_request_continued(struct uri_record *record, struct timeval tv)
     request->record.ack = record->seq + record->tcp_datalen;
     /* request->record.seq = record->ack; */
 LAST:
-    if (thread_created)
-        pthread_mutex_unlock(&stats_lock);    
+   unlock_request(hash);
 }
 
-void fin_response_(struct uri_request *request)
-{
-    if(request == NULL) {
-        return;
-    }
-
-    /* remove it from hash table */
-    remove_request(request);
-    remove_from_recycle(request);
-
-    free_uri_request(request);
-}
-
-void fin_response(struct uri_record *record)
-{
-    struct uri_request *request;
-
-    if (thread_created)
-        pthread_mutex_lock(&stats_lock);
-
-    request = find_response_noseq(record);
-    fin_response_(request);
-
-    if (thread_created)
-        pthread_mutex_unlock(&stats_lock);
-}
-
-int finish_request(struct uri_record *record, struct timeval tv, int is_fin)
+void finish_request(struct uri_record *record, struct timeval tv)
 {
     struct uri_request *request;
     struct uri_stats *uri;
-    float time_used=0;
-    int err = 0;
-    if (thread_created)
-        pthread_mutex_lock(&stats_lock);
+    long long time_used=0;
+    //int stats_key;
+    int hash = hash_request(record);
+    lock_request(hash);
 
-    request = find_response(record);
+    request = find_request(record);
     if(request == NULL) {
-        err = -1;
         goto LAST;
     }
     if(see_recycle && request->flag) {
@@ -722,78 +715,88 @@ int finish_request(struct uri_record *record, struct timeval tv, int is_fin)
     }
     request->flag = 0;
     uri = request->stat;
+    /* remove it from hash table */
+    remove_request(request);
 
     if(uri == NULL) {
-        err = -1;
+        pthread_mutex_lock(&request_queue_lock);
+        remove_from_recycle(request);
+        pthread_mutex_unlock(&request_queue_lock);
+        free_uri_request(request);
         goto LAST;
     }
     time_used = (tv.tv_sec - request->timestamp.tv_sec) * 1000000 + (tv.tv_usec - request->timestamp.tv_usec);
-    uri->time_used += time_used;
-    uri->rep_count++;
-    uri->out_datalen += record->tcp_datalen;
-#if 0
-    printf("req.ack:%u res.seq:%u port1:%u port2:%u time_used %f count:%d\n", 
-	request->record.ack, record->seq, 
-        request->record.src_port, record->dst_port,
-	uri->time_used/1000000, uri->rep_count);
-#endif 
 
+    //stats_key = hash_stats(uri);
+    //lock_stats(stats_key);
+    //uri->time_used += time_used;
+    //uri->rep_count++;
+    __sync_fetch_and_add(&(uri->time_used), time_used);
+    __sync_fetch_and_add(&(uri->rep_count), 1);
+    //unlock_stats(stats_key);
+
+    pthread_mutex_lock(&request_queue_lock);
+    remove_from_recycle(request);
+    pthread_mutex_unlock(&request_queue_lock);
+
+    free_uri_request(request);
 LAST:
-    if(is_fin) {
-        fin_response_(request);
-    }
-    if (thread_created)
-        pthread_mutex_unlock(&stats_lock);
-    return err;
+    unlock_request(hash);
 }
 
-int update_stats(struct uri_record *record, struct timeval tv) 
-{
-    struct uri_stats *node;
-    unsigned int hashval;
+void update_stats(struct uri_record *record, struct timeval tv) {
+    struct uri_stats *node = NULL;
+    struct uri_request *p;
+    unsigned int hashval, req_hashval;
 
-    if ((record->uri == NULL) || (stats == NULL)) return -1;
+    if ((record->uri[0] == '\0') || (stats == NULL)) return;
 
-    if (thread_created)
-        pthread_mutex_lock(&stats_lock);
+    req_hashval = hash_request(record);
+    lock_request(req_hashval);
+    p = find_request(record);
+    if(p != NULL) {
+        node = p->stat;
+    }
+    unlock_request(req_hashval);
 
-    if ((node = get_uri(record)) == NULL) {
-        node = get_node();
-        memset(node, 0, sizeof(*node));
-        node->port = record->dst_port;
-        node->host = record->dst_addr;
-        /* used for testing */
-        debug_ascii(record->uri, "Entry");
-        str_copy(node->uri, record->uri, MAX_URI_LEN);
-        //snprintf(node->uri, MAX_URI_LEN, record->uri);
+    if (NULL == node) {
+        hashval = hash_stats_record(record);
+        lock_stats(hashval);
 
-        hashval = hash_uri(record);
+        if ((node = get_uri(record)) == NULL) {
+            node = get_node();
+            memset(node, 0, sizeof(*node));
+            node->port = record->dst_port;
+            node->host = record->dst_addr;
+            /* used for testing */
+            //debug_ascii(record->uri, "Entry");
+            str_copy(node->uri, record->uri, MAX_URI_LEN);
+            //snprintf(node->uri, MAX_URI_LEN, record->uri);
 #ifdef DEBUG
-        ASSERT((hashval >= 0) && (hashval < HASHSIZE));
+            ASSERT((hashval >= 0) && (hashval < HASH_SIZE));
 #endif
-        node->first_packet = tv.tv_sec;
-        /* Link node into hash */
-        node->next = stats[hashval];
-        stats[hashval] = node;
+            node->first_packet = tv.tv_sec;
+            /* Link node into hash */
+            node->next = stats[hashval];
+            stats[hashval] = node;
+        }
+        unlock_stats(hashval);
+    }
+    //no found request
+    if (NULL == p) {
+        add_request(record, tv, node);
     }
 
-    if (node->first_packet == 0) {
-        node->first_packet = tv.tv_sec;
-    }
+    __sync_val_compare_and_swap(&(node->first_packet), 0, tv.tv_sec);
     node->last_packet = tv.tv_sec;
-    node->count++;
-    node->total++;
-    node->in_datalen += record->tcp_datalen;
-    add_request(record, tv, node);
-    if (thread_created)
-        pthread_mutex_unlock(&stats_lock);
-
-    return 0;
+    __sync_fetch_and_add(&(node->count), 1);
+    //node->total++;
+    return;
 }
 
 struct uri_stats *get_uri(struct uri_record *record) {
     struct uri_stats *node;
-    for (node = stats[hash_uri(record)]; node != NULL; node = node->next) {
+    for (node = stats[hash_stats_record(record)]; node != NULL; node = node->next) {
         //printf("str:%s uri:%s\n", str, node->uri);
         if (str_compare(record->uri, node->uri) == 0 &&
             record->dst_port == node->port &&
@@ -819,7 +822,7 @@ struct uri_stats *get_node()
 
 void put_node(struct uri_stats *node)
 {
-    strcpy(node->uri,"zzzzzz");
+    //strcpy(node->uri,"zzzzzz");
 #ifdef USE_SLAB
     hurd_slab_dealloc(stats_slab, node);
 #else

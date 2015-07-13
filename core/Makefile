@@ -1,9 +1,9 @@
 
 CC		= gcc
 CCFLAGS  	= -Wall -I/usr/include/pcap -I/usr/local/include/pcap
-DEBUGFLAGS	= -O0 -Wall -ggdb -DDEBUG -I/usr/include/pcap -I/usr/local/include/pcap
-LIBS		= -lpcap -lm -pthread
-PROG		= httpcap
+DEBUGFLAGS	= -O0 -Wall -g -DDEBUG -I/usr/include/pcap -I/usr/local/include/pcap
+LIBS		= -lpcap -ljemalloc -lm -pthread
+PROG		= httpcap23
 FILES		= cap.c  utils.c stats.c slab.c
 
 .PHONY: all debug clean
